@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Web Star Trail</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #000; color: #eee; font: 15px system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
+  canvas { display: block; width: 100%; background: #111; }
+  #status { font: 13px ui-monospace, monospace; white-space: pre-wrap; margin: 10px 0; min-height: 3.2em; }
+  .row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+  .row label { width: 76px; flex: none; color: #aaa; }
+  select, button { font: inherit; padding: 10px 12px; border-radius: 8px; border: 1px solid #444; background: #1c1c1e; color: #eee; }
+  select { flex: 1; min-width: 0; }
+  .buttons { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+  button.primary { background: #0a84ff; border-color: #0a84ff; color: #fff; }
+  button.recording { background: #d70015; border-color: #d70015; }
+  button:disabled { opacity: 0.4; }
+  .note { color: #888; font-size: 12px; margin: 6px 0; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="view" width="4" height="3"></canvas>
+  <div id="status">Tap Open Camera.</div>
+  <div class="row"><label for="camera">Camera</label><select id="camera" disabled></select></div>
+  <div class="row"><label for="exposure">Exposure</label><select id="exposure" disabled></select></div>
+  <div class="row"><label for="iso">ISO</label><select id="iso" disabled></select></div>
+  <div class="note" id="note"></div>
+  <div class="buttons">
+    <button id="open" class="primary">Open Camera</button>
+    <button id="record" disabled>Start</button>
+    <button id="toggle" disabled>Show Live</button>
+    <button id="reset" disabled>Reset</button>
+    <button id="save" disabled style="grid-column: 1 / 3">Save JPEG</button>
+  </div>
+</main>
+<script>
+'use strict';
+// 星の軌跡の最小限の Web アプリ。カメラの映像フレームを WebGL で比較明合成(画素ごとの最大値)し、止めたら JPEG で保存する。
+// 露光の決め方は端末で分かれる。手動露光に対応していれば(Android の Chrome)露光時間と ISO を固定する。対応していなければ(iPhone の WebKit)フレームレートを毎秒1枚に下げ、自動露出が露光を伸ばすのに任せる。
+
+const $ = id => document.getElementById(id);
+const canvas = $('view');
+const video = document.createElement('video');
+video.playsInline = true; video.muted = true;
+
+const state = {
+  stream: null, track: null, caps: {}, manual: false,
+  recording: false, showLive: false, skip: 0, frames: 0, startedAt: 0, lastFrameAt: 0,
+  gl: null, program: null, videoTexture: null, trailTexture: null, trailBuffer: null,
+  wakeLock: null, timer: null, errors: [],
+};
+const AUTOTEST = new URLSearchParams(location.search).has('autotest') || window.__autotest === true;
+const native = name => window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers[name];
+
+function setStatus(text) { $('status').textContent = text; }
+function fail(where, error) { state.errors.push(where + ': ' + error); setStatus(where + ': ' + error); }
+
+// ---- カメラ ----
+
+async function openCamera(deviceId) {
+  if (state.stream) state.stream.getTracks().forEach(t => t.stop());
+  const base = {width: {ideal: 4080}, height: {ideal: 3064}};
+  const constraints = deviceId ? {deviceId: {exact: deviceId}, ...base} : {facingMode: {ideal: 'environment'}, ...base};
+  state.stream = await navigator.mediaDevices.getUserMedia({video: constraints, audio: false});
+  state.track = state.stream.getVideoTracks()[0];
+  state.caps = state.track.getCapabilities ? state.track.getCapabilities() : {};
+  state.manual = !!(state.caps.exposureMode && state.caps.exposureMode.includes('manual') && state.caps.exposureTime);
+  video.srcObject = state.stream;
+  await video.play();
+  setupGL(video.videoWidth, video.videoHeight);
+}
+
+async function listCameras() {
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput');
+  // 複数のレンズを束ねた仮想カメラは暗さでレンズを乗り換えるので、単体の背面カメラを既定にする
+  const back = devices.filter(d => !/front|前面/i.test(d.label));
+  const preferred = back.find(d => /^(Back Camera|背面カメラ)$/i.test(d.label)) || back.find(d => /back|背面|rear/i.test(d.label)) || back[0] || devices[0];
+  const select = $('camera');
+  select.innerHTML = '';
+  for (const d of back.length ? back : devices) {
+    const option = new Option(d.label || 'Camera', d.deviceId);
+    option.selected = preferred && d.deviceId === preferred.deviceId;
+    select.add(option);
+  }
+  return preferred ? preferred.deviceId : null;
+}
+
+function fillControls() {
+  const caps = state.caps, exposure = $('exposure'), iso = $('iso');
+  exposure.innerHTML = ''; iso.innerHTML = '';
+  if (state.manual) {
+    const maxSeconds = caps.exposureTime.max / 10000;   // exposureTime の単位は 100 マイクロ秒
+    for (const s of [1, 2, 4, 8, 16, 30]) if (s <= maxSeconds + 0.01) exposure.add(new Option(s + ' s', s));
+    exposure.value = exposure.options.length > 2 ? '4' : exposure.options[0].value;
+    if (caps.iso) {
+      for (const v of [100, 200, 400, 800, 1600, 3200, 6400]) if (v >= caps.iso.min && v <= caps.iso.max) iso.add(new Option(v, v));
+      iso.value = iso.querySelector('option[value="800"]') ? '800' : iso.options[iso.options.length - 1].value;
+    }
+    $('note').textContent = 'Manual exposure: shutter, ISO and focus are fixed.';
+  } else {
+    exposure.add(new Option('Auto at 1 fps (about 1 s)', 1));
+    iso.add(new Option('Auto', 0));
+    $('note').textContent = 'This browser has no manual exposure. The frame rate is lowered to 1 fps so that auto exposure can lengthen the shutter. ISO and focus stay automatic.';
+  }
+  exposure.disabled = !state.manual; iso.disabled = !(state.manual && caps.iso); $('camera').disabled = false;
+}
+
+// 露光・ISO・フォーカス・ホワイトバランスを固定する。まとめて拒まれたら、項目を減らして試し直す。
+async function applySettings() {
+  const caps = state.caps, track = state.track;
+  if (!state.manual) {
+    try { await track.applyConstraints({frameRate: {exact: 1}, width: {ideal: 4080}, height: {ideal: 3064}}); }
+    catch (e) { try { await track.applyConstraints({frameRate: {ideal: 1}}); } catch (e2) { fail('frame rate', e2); } }
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')) {
+      try { await track.applyConstraints({frameRate: {ideal: 1}, advanced: [{whiteBalanceMode: 'manual'}]}); } catch (e) { /* 自動のまま続ける */ }
+    }
+    return;
+  }
+  const exposure = {exposureMode: 'manual', exposureTime: Math.min(Number($('exposure').value) * 10000, caps.exposureTime.max)};
+  if (caps.iso) exposure.iso = Math.min(Math.max(Number($('iso').value), caps.iso.min), caps.iso.max);
+  const focus = (caps.focusMode && caps.focusMode.includes('manual') && caps.focusDistance) ? {focusMode: 'manual', focusDistance: caps.focusDistance.max} : {};
+  const white = (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('manual')) ? {whiteBalanceMode: 'manual'} : {};
+  if (white.whiteBalanceMode && caps.colorTemperature) white.colorTemperature = Math.min(Math.max(4000, caps.colorTemperature.min), caps.colorTemperature.max);
+  for (const set of [{...exposure, ...focus, ...white}, {...exposure, ...focus}, exposure]) {
+    try { await track.applyConstraints({advanced: [set]}); return; } catch (e) { state.errors.push('applyConstraints: ' + e); }
+  }
+  fail('exposure', 'could not apply manual exposure');
+}
+
+// ---- WebGL: 比較明合成 ----
+
+function setupGL(width, height) {
+  canvas.width = width; canvas.height = height;
+  const gl = state.gl = state.gl || canvas.getContext('webgl2', {preserveDrawingBuffer: true, antialias: false, alpha: false});
+  if (!gl) throw new Error('WebGL2 is not available');
+  if (Math.max(width, height) > gl.getParameter(gl.MAX_TEXTURE_SIZE)) throw new Error('frame is larger than the maximum texture size');
+  if (!state.program) {
+    const compile = (type, source) => { const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s); if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s)); return s; };
+    const program = state.program = gl.createProgram();
+    // 画面全体を覆う三角形1枚
+    gl.attachShader(program, compile(gl.VERTEX_SHADER, '#version 300 es\nout vec2 uv; void main() { vec2 p = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2)); uv = p; gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0); }'));
+    gl.attachShader(program, compile(gl.FRAGMENT_SHADER, '#version 300 es\nprecision mediump float; in vec2 uv; uniform sampler2D image; out vec4 color; void main() { color = vec4(texture(image, uv).rgb, 1.0); }'));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+    gl.useProgram(program);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  }
+  const makeTexture = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
+    return t; };
+  state.videoTexture = makeTexture();
+  state.trailTexture = makeTexture();
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  state.trailBuffer = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.trailBuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.trailTexture, 0);
+  resetTrail();
+}
+
+function resetTrail() {
+  const gl = state.gl;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.trailBuffer);
+  gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  state.frames = 0;
+}
+
+function draw(texture, target, lighten) {
+  const gl = state.gl;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, target);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  if (lighten) { gl.enable(gl.BLEND); gl.blendEquation(gl.MAX); gl.blendFunc(gl.ONE, gl.ONE); } else { gl.disable(gl.BLEND); }
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+}
+
+// 映像の1フレームを取り込む。同じフレームをもう一度重ねても最大値は変わらないので、重複の心配は要らない。
+function process(isNewFrame) {
+  if (!state.gl || video.readyState < 2) return;
+  if (video.videoWidth !== canvas.width || video.videoHeight !== canvas.height) setupGL(video.videoWidth, video.videoHeight);
+  const gl = state.gl;
+  gl.bindTexture(gl.TEXTURE_2D, state.videoTexture);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  if (state.recording) {
+    if (state.skip > 0) { if (isNewFrame) state.skip--; }
+    else { draw(state.videoTexture, state.trailBuffer, true); if (isNewFrame) state.frames++; }
+  }
+  const showTrail = !state.showLive && (state.recording || state.frames > 0);
+  draw(showTrail ? state.trailTexture : state.videoTexture, null, false);
+  if (isNewFrame) state.lastFrameAt = performance.now();
+  updateStatus();
+}
+
+function updateStatus() {
+  const s = state.track ? state.track.getSettings() : {};
+  const lines = [canvas.width + ' x ' + canvas.height + '  ' + (state.manual ? 'manual' : 'auto')
+    + (s.exposureTime ? '  ' + (s.exposureTime / 10000).toFixed(2) + ' s' : '') + (s.iso ? '  ISO ' + Math.round(s.iso) : '') + (s.frameRate ? '  ' + s.frameRate + ' fps' : '')];
+  if (state.recording || state.frames) {
+    const elapsed = state.recording ? (performance.now() - state.startedAt) / 1000 : state.elapsed;
+    lines.push((state.recording ? 'Recording  ' : 'Stopped  ') + state.frames + ' frames  ' + Math.floor(elapsed / 60) + ':' + String(Math.floor(elapsed % 60)).padStart(2, '0'));
+  } else lines.push('Live preview');
+  if (state.errors.length) lines.push(state.errors[state.errors.length - 1]);
+  setStatus(lines.join('\n'));
+}
+
+function startLoop() {
+  const onFrame = () => { process(true); video.requestVideoFrameCallback(onFrame); };
+  if (video.requestVideoFrameCallback) video.requestVideoFrameCallback(onFrame);
+  // フレーム通知が来ない環境への保険。しばらく通知が無ければ、いまの映像をそのまま取り込む
+  clearInterval(state.timer);
+  state.timer = setInterval(() => { if (performance.now() - state.lastFrameAt > 1500) process(!video.requestVideoFrameCallback); }, 500);
+}
+
+// ---- 操作 ----
+
+async function keepAwake(on) {
+  try {
+    if (on && 'wakeLock' in navigator) state.wakeLock = await navigator.wakeLock.request('screen');
+    if (!on && state.wakeLock) { await state.wakeLock.release(); state.wakeLock = null; }
+  } catch (e) { /* 画面が消えるだけなので続ける */ }
+}
+document.addEventListener('visibilitychange', () => { if (state.recording && document.visibilityState === 'visible') keepAwake(true); });
+
+async function start() {
+  await applySettings();
+  resetTrail();
+  state.skip = 2;            // 設定を変えた直後のフレームは捨てる
+  state.recording = true; state.showLive = false; state.startedAt = performance.now();
+  $('record').textContent = 'Stop'; $('record').classList.add('recording'); $('toggle').textContent = 'Show Live';
+  for (const id of ['camera', 'exposure', 'iso', 'save', 'reset']) $(id).disabled = true;
+  await keepAwake(true);
+}
+
+async function stop() {
+  state.recording = false; state.elapsed = (performance.now() - state.startedAt) / 1000;
+  $('record').textContent = 'Start'; $('record').classList.remove('recording');
+  $('camera').disabled = false; $('exposure').disabled = !state.manual; $('iso').disabled = !(state.manual && state.caps.iso);
+  $('save').disabled = state.frames === 0; $('reset').disabled = false;
+  await keepAwake(false);
+  process(false);
+}
+
+function stamp() { const d = new Date(), p = n => String(n).padStart(2, '0'); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()); }
+
+async function save() {
+  draw(state.trailTexture, null, false);
+  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
+  const name = 'startrail-' + stamp() + '-' + state.frames + 'frames.jpg';
+  if (native('save')) {
+    // アプリに埋め込まれた WebKit ではダウンロードが使えないので、アプリ側へ渡して保存してもらう
+    const data = await new Promise(resolve => { const r = new FileReader(); r.onload = () => resolve(r.result.split(',')[1]); r.readAsDataURL(blob); });
+    native('save').postMessage({name, data});
+    setStatus('Saved in the app: ' + name);
+  } else if (AUTOTEST) {
+    await fetch('/save?name=' + encodeURIComponent(name), {method: 'POST', body: blob});
+  } else {
+    const file = new File([blob], name, {type: 'image/jpeg'});
+    if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({files: [file]})) {
+      await navigator.share({files: [file]});
+    } else {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+  }
+  return name;
+}
+
+$('open').onclick = async () => {
+  try {
+    await openCamera(null);
+    const preferred = await listCameras();
+    if (preferred && state.track.getSettings().deviceId !== preferred) await openCamera(preferred);
+    fillControls();
+    await applySettings();
+    startLoop();
+    $('open').disabled = true;
+    for (const id of ['record', 'toggle']) $(id).disabled = false;
+  } catch (e) { fail('camera', e); }
+};
+$('camera').onchange = async () => { try { await openCamera($('camera').value); fillControls(); await applySettings(); } catch (e) { fail('camera', e); } };
+$('exposure').onchange = $('iso').onchange = () => applySettings();
+$('record').onclick = () => state.recording ? stop() : start();
+$('toggle').onclick = () => { state.showLive = !state.showLive; $('toggle').textContent = state.showLive ? 'Show Trail' : 'Show Live'; process(false); };
+$('reset').onclick = () => { resetTrail(); $('save').disabled = true; process(false); };
+$('save').onclick = () => save().catch(e => fail('save', e));
+
+// ---- 自己確認(開発用): ?autotest を付けて開くと、操作なしで数フレーム重ねて保存し、結果を報告する ----
+if (AUTOTEST) (async () => {
+  const report = {};
+  try {
+    await $('open').onclick();
+    if (state.manual) { $('exposure').value = '1'; }
+    await start();
+    const end = performance.now() + 30000;
+    while (state.frames < 6 && performance.now() < end) await new Promise(r => setTimeout(r, 250));
+    await stop();
+    Object.assign(report, {ua: navigator.userAgent, size: [canvas.width, canvas.height], manual: state.manual, frames: state.frames,
+      elapsed: state.elapsed, settings: state.track.getSettings(), camera: state.track.label, errors: state.errors,
+      frameCallback: !!video.requestVideoFrameCallback});
+    report.saved = await save();
+  } catch (e) { report.fatal = String(e); report.errors = state.errors; }
+  const text = JSON.stringify(report, null, 1);
+  if (native('report')) native('report').postMessage(text); else fetch('/report', {method: 'POST', body: text}).catch(() => {});
+})();
+</script>
+</body>
+</html>
