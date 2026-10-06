@@ -9,6 +9,8 @@
   body { margin: 0; background: #000; color: #eee; font: 15px system-ui, sans-serif; }
   main { max-width: 720px; margin: 0 auto; padding: 12px 16px calc(24px + env(safe-area-inset-bottom)); }
   canvas { display: block; width: 100%; background: #111; }
+  #stage { position: relative; }
+  #countdown { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 128px; font-weight: 500; color: #fff; text-shadow: 0 0 8px #000; pointer-events: none; }
   #status { font: 13px ui-monospace, monospace; white-space: pre-wrap; margin: 10px 0; min-height: 3.2em; }
   .row { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
   .row label { width: 76px; flex: none; color: #aaa; }
@@ -23,7 +25,10 @@
 </head>
 <body>
 <main>
-  <canvas id="view" width="4" height="3"></canvas>
+  <div id="stage">
+    <canvas id="view" width="4" height="3"></canvas>
+    <div id="countdown"></div>
+  </div>
   <div class="buttons">
     <button id="open" class="primary">Open Camera</button>
     <button id="record" disabled>Start</button>
@@ -50,7 +55,8 @@ video.playsInline = true; video.muted = true;
 const state = {
   stream: null, track: null, caps: {}, manual: false,
   recording: false, showLive: false, skip: 0, frames: 0, startedAt: 0, lastFrameAt: 0,
-  gl: null, program: null, videoTexture: null, trailTexture: null, trailBuffer: null,
+  countdownTimer: null, audio: null,
+  gl: null, program: null, videoTexture: null, pendingTexture: null, hasPending: false, trailTexture: null, trailBuffer: null,
   wakeLock: null, timer: null, errors: [],
 };
 const AUTOTEST = new URLSearchParams(location.search).has('autotest') || window.__autotest === true;
@@ -153,6 +159,8 @@ function setupGL(width, height) {
     for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_2D, k, v);
     return t; };
   state.videoTexture = makeTexture();
+  state.pendingTexture = makeTexture();
+  state.hasPending = false;
   state.trailTexture = makeTexture();
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
   state.trailBuffer = gl.createFramebuffer();
@@ -166,6 +174,7 @@ function resetTrail() {
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.trailBuffer);
   gl.clearColor(0, 0, 0, 1); gl.clear(gl.COLOR_BUFFER_BIT);
   state.frames = 0;
+  state.hasPending = false;
 }
 
 function draw(texture, target, lighten) {
@@ -177,20 +186,28 @@ function draw(texture, target, lighten) {
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
-// 映像の1フレームを取り込む。同じフレームをもう一度重ねても最大値は変わらないので、重複の心配は要らない。
+// 映像の1フレームを取り込む。
+// 重ねるのは常に「1枚前」のフレーム。いま届いたフレームは次のフレームが来るまで保留し、止めたときは保留ぶんを捨てる。停止のタップで端末が揺れても、その瞬間に露光していたフレームが合成に入らない。
 function process(isNewFrame) {
   if (!state.gl || video.readyState < 2) return;
   if (video.videoWidth !== canvas.width || video.videoHeight !== canvas.height) setupGL(video.videoWidth, video.videoHeight);
   const gl = state.gl;
-  gl.bindTexture(gl.TEXTURE_2D, state.videoTexture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, video);
-  if (state.recording) {
-    if (state.skip > 0) { if (isNewFrame) state.skip--; }
-    else { draw(state.videoTexture, state.trailBuffer, true); if (isNewFrame) state.frames++; }
+  if (isNewFrame) {
+    if (state.recording && state.skip === 0 && state.hasPending) {
+      draw(state.pendingTexture, state.trailBuffer, true);
+      state.frames++;
+    }
+    // 保留していたテクスチャを受け皿に回し、新しいフレームを載せる(テクスチャの中身は写さず、役割だけ入れ替える)
+    [state.videoTexture, state.pendingTexture] = [state.pendingTexture, state.videoTexture];
+    gl.bindTexture(gl.TEXTURE_2D, state.pendingTexture);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, video);
+    if (state.recording) {
+      if (state.skip > 0) { state.skip--; state.hasPending = false; } else { state.hasPending = true; }
+    }
+    state.lastFrameAt = performance.now();
   }
   const showTrail = !state.showLive && (state.recording || state.frames > 0);
-  draw(showTrail ? state.trailTexture : state.videoTexture, null, false);
-  if (isNewFrame) state.lastFrameAt = performance.now();
+  draw(showTrail ? state.trailTexture : state.pendingTexture, null, false);
   updateStatus();
 }
 
@@ -201,7 +218,7 @@ function updateStatus() {
   if (state.recording || state.frames) {
     const elapsed = state.recording ? (performance.now() - state.startedAt) / 1000 : state.elapsed;
     lines.push((state.recording ? 'Recording  ' : 'Stopped  ') + state.frames + ' frames  ' + Math.floor(elapsed / 60) + ':' + String(Math.floor(elapsed % 60)).padStart(2, '0'));
-  } else lines.push('Live preview');
+  } else lines.push(state.countdownTimer ? 'Starting…' : 'Live preview');
   if (state.errors.length) lines.push(state.errors[state.errors.length - 1]);
   setStatus(lines.join('\n'));
 }
@@ -224,18 +241,64 @@ async function keepAwake(on) {
 }
 document.addEventListener('visibilitychange', () => { if (state.recording && document.visibilityState === 'visible') keepAwake(true); });
 
+// 押してから 1・2・3 秒後に音を鳴らして数字を出し、4 秒後に撮影を始める。押した手の揺れが収まってから撮り始めるため。
+function beep() {
+  try {
+    const audio = state.audio = state.audio || new (window.AudioContext || window.webkitAudioContext)();
+    const t = audio.currentTime, osc = audio.createOscillator(), gain = audio.createGain();
+    osc.frequency.value = 1480;
+    // 約3ミリ秒で立ち上げ、約25ミリ秒鳴らして、速く減衰させる(ネイティブ版の音と同じ形)
+    gain.gain.setValueAtTime(0, t);
+    gain.gain.linearRampToValueAtTime(0.35, t + 0.003);
+    gain.gain.setValueAtTime(0.35, t + 0.025);
+    gain.gain.exponentialRampToValueAtTime(0.0005, t + 0.07);
+    osc.connect(gain).connect(audio.destination);
+    osc.start(t); osc.stop(t + 0.08);
+  } catch (e) { /* 音が出せなくても撮影は続ける */ }
+}
+
 async function start() {
   await applySettings();
+  // 音は利用者の操作の中で用意しておく(あとからでは鳴らせないブラウザがある)
+  try { state.audio = state.audio || new (window.AudioContext || window.webkitAudioContext)(); await state.audio.resume(); } catch (e) {}
+  state.showLive = true;                                   // 待っているあいだは、いまの映像を見せる
+  $('record').textContent = 'Cancel'; $('record').classList.add('recording');
+  for (const id of ['camera', 'exposure', 'iso', 'save', 'reset', 'toggle']) $(id).disabled = true;
+  await keepAwake(true);
+  const began = performance.now();
+  let shown = 0;
+  state.countdownTimer = setInterval(() => {
+    const elapsed = (performance.now() - began) / 1000;
+    const number = elapsed >= 1 && elapsed < 4 ? 4 - Math.floor(elapsed) : 0;
+    if (number && number !== shown) { shown = number; beep(); }
+    $('countdown').textContent = number ? String(number) : '';
+    $('countdown').style.opacity = number ? String(1 - (elapsed - Math.floor(elapsed))) : '0';
+    if (elapsed >= 4) { clearInterval(state.countdownTimer); state.countdownTimer = null; $('countdown').textContent = ''; beginRecording(); }
+  }, 50);
+  updateStatus();
+}
+
+function beginRecording() {
   resetTrail();
   state.skip = 2;            // 設定を変えた直後のフレームは捨てる
   state.recording = true; state.showLive = false; state.startedAt = performance.now();
-  $('record').textContent = 'Stop'; $('record').classList.add('recording'); $('toggle').textContent = 'Show Live';
-  for (const id of ['camera', 'exposure', 'iso', 'save', 'reset']) $(id).disabled = true;
-  await keepAwake(true);
+  $('record').textContent = 'Stop'; $('toggle').textContent = 'Show Live'; $('toggle').disabled = false;
+}
+
+async function cancelCountdown() {
+  clearInterval(state.countdownTimer); state.countdownTimer = null;
+  $('countdown').textContent = '';
+  state.showLive = false;
+  $('record').textContent = 'Start'; $('record').classList.remove('recording');
+  $('camera').disabled = false; $('exposure').disabled = !state.manual; $('iso').disabled = !(state.manual && state.caps.iso);
+  $('toggle').disabled = false; $('save').disabled = state.frames === 0; $('reset').disabled = false;
+  await keepAwake(false);
+  process(false);
 }
 
 async function stop() {
-  state.recording = false; state.elapsed = (performance.now() - state.startedAt) / 1000;
+  // 保留している最後の1枚は重ねずに捨てる(停止のタップの揺れを避ける)
+  state.recording = false; state.hasPending = false; state.elapsed = (performance.now() - state.startedAt) / 1000;
   $('record').textContent = 'Start'; $('record').classList.remove('recording');
   $('camera').disabled = false; $('exposure').disabled = !state.manual; $('iso').disabled = !(state.manual && state.caps.iso);
   $('save').disabled = state.frames === 0; $('reset').disabled = false;
@@ -282,7 +345,7 @@ $('open').onclick = async () => {
 };
 $('camera').onchange = async () => { try { await openCamera($('camera').value); fillControls(); await applySettings(); } catch (e) { fail('camera', e); } };
 $('exposure').onchange = $('iso').onchange = () => applySettings();
-$('record').onclick = () => state.recording ? stop() : start();
+$('record').onclick = () => state.countdownTimer ? cancelCountdown() : state.recording ? stop() : start();
 $('toggle').onclick = () => { state.showLive = !state.showLive; $('toggle').textContent = state.showLive ? 'Show Trail' : 'Show Live'; process(false); };
 $('reset').onclick = () => { resetTrail(); $('save').disabled = true; process(false); };
 $('save').onclick = () => save().catch(e => fail('save', e));
@@ -294,7 +357,7 @@ if (AUTOTEST) (async () => {
     await $('open').onclick();
     if (state.manual) { $('exposure').value = '1'; }
     await start();
-    const end = performance.now() + 30000;
+    const end = performance.now() + 40000;
     while (state.frames < 6 && performance.now() < end) await new Promise(r => setTimeout(r, 250));
     await stop();
     Object.assign(report, {ua: navigator.userAgent, size: [canvas.width, canvas.height], manual: state.manual, frames: state.frames,
