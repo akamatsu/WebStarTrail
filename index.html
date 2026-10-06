@@ -34,7 +34,8 @@
     <button id="record" disabled>Start</button>
     <button id="toggle" disabled>Show Live</button>
     <button id="reset" disabled>Reset</button>
-    <button id="save" disabled style="grid-column: 1 / 3">Save JPEG</button>
+    <button id="save" disabled>Save JPEG</button>
+    <button id="savelog" disabled>Save Log</button>
   </div>
   <div id="status">Tap Open Camera.</div>
   <div class="row"><label for="camera">Camera</label><select id="camera" disabled></select></div>
@@ -56,6 +57,7 @@ const state = {
   stream: null, track: null, caps: {}, manual: false,
   recording: false, showLive: false, skip: 0, frames: 0, startedAt: 0, lastFrameAt: 0,
   countdownTimer: null, audio: null,
+  motion: [], star: null, smallBuffer: null, smallTexture: null, smallSize: [0, 0], pixels: null,
   gl: null, program: null, videoTexture: null, pendingTexture: null, hasPending: false, trailTexture: null, trailBuffer: null,
   wakeLock: null, timer: null, errors: [],
 };
@@ -163,6 +165,14 @@ function setupGL(width, height) {
   state.hasPending = false;
   state.trailTexture = makeTexture();
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  // 診断用: フレームを 1/4 に縮めて読み出すための描き込み先
+  state.smallSize = [Math.floor(width / 4), Math.floor(height / 4)];
+  state.smallTexture = makeTexture();
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, state.smallSize[0], state.smallSize[1], 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  state.smallBuffer = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.smallBuffer);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.smallTexture, 0);
+  state.pixels = new Uint8Array(state.smallSize[0] * state.smallSize[1] * 4);
   state.trailBuffer = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, state.trailBuffer);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, state.trailTexture, 0);
@@ -186,6 +196,39 @@ function draw(texture, target, lighten) {
   gl.drawArrays(gl.TRIANGLES, 0, 3);
 }
 
+// 診断: フレームごとに、いちばん明るい星の位置を記録する。星はゆっくり一方向に動くだけのはずなので、位置が飛んでいれば「画面全体がずれた」と分かり、それが撮影のいつ起きたかも残る。
+// 最初のフレームで画面全体からいちばん明るい点を選び、以後はその近く(前回の位置の周囲)だけを探して同じ星を追う。座標は元の画素に直して記録する。
+function trackStar(texture) {
+  const gl = state.gl, [sw, sh] = state.smallSize, px = state.pixels;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, state.smallBuffer);
+  gl.viewport(0, 0, sw, sh);
+  gl.disable(gl.BLEND);
+  gl.bindTexture(gl.TEXTURE_2D, texture);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.readPixels(0, 0, sw, sh, gl.RGBA, gl.UNSIGNED_BYTE, px);
+  const reach = 60;   // 元の画素で 240 まで追える
+  let x0 = 0, x1 = sw, y0 = 0, y1 = sh;
+  if (state.star) { x0 = Math.max(0, state.star.x - reach); x1 = Math.min(sw, state.star.x + reach + 1); y0 = Math.max(0, state.star.y - reach); y1 = Math.min(sh, state.star.y + reach + 1); }
+  let best = -1, bx = 0, by = 0;
+  for (let y = y0; y < y1; y++) for (let x = x0, i = (y * sw + x0) * 4; x < x1; x++, i += 4) {
+    const v = px[i] + px[i + 1] + px[i + 2];
+    if (v > best) { best = v; bx = x; by = y; }
+  }
+  state.star = {x: bx, y: by};
+  state.motion.push({t: (performance.now() - state.startedAt) / 1000, x: bx * 4, y: by * 4, v: best});
+}
+
+// 撮影全体での、フレーム間の最大の飛び(元の画素)と、大きく飛んだ回数。
+function motionSummary() {
+  let max = 0, jumps = 0;
+  for (let i = 1; i < state.motion.length; i++) {
+    const d = Math.hypot(state.motion[i].x - state.motion[i - 1].x, state.motion[i].y - state.motion[i - 1].y);
+    if (d > max) max = d;
+    if (d > 12) jumps++;
+  }
+  return {max: Math.round(max), jumps};
+}
+
 // 映像の1フレームを取り込む。
 // 重ねるのは常に「1枚前」のフレーム。いま届いたフレームは次のフレームが来るまで保留し、止めたときは保留ぶんを捨てる。停止のタップで端末が揺れても、その瞬間に露光していたフレームが合成に入らない。
 function process(isNewFrame) {
@@ -202,7 +245,7 @@ function process(isNewFrame) {
     gl.bindTexture(gl.TEXTURE_2D, state.pendingTexture);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, video);
     if (state.recording) {
-      if (state.skip > 0) { state.skip--; state.hasPending = false; } else { state.hasPending = true; }
+      if (state.skip > 0) { state.skip--; state.hasPending = false; } else { state.hasPending = true; trackStar(state.pendingTexture); }
     }
     state.lastFrameAt = performance.now();
   }
@@ -219,6 +262,7 @@ function updateStatus() {
     const elapsed = state.recording ? (performance.now() - state.startedAt) / 1000 : state.elapsed;
     lines.push((state.recording ? 'Recording  ' : 'Stopped  ') + state.frames + ' frames  ' + Math.floor(elapsed / 60) + ':' + String(Math.floor(elapsed % 60)).padStart(2, '0'));
   } else lines.push(state.countdownTimer ? 'Starting…' : 'Live preview');
+  if (!state.recording && state.motion.length > 1) { const m = motionSummary(); lines.push('Star jumps over 12 px: ' + m.jumps + '  (largest ' + m.max + ' px)'); }
   if (state.errors.length) lines.push(state.errors[state.errors.length - 1]);
   setStatus(lines.join('\n'));
 }
@@ -263,7 +307,7 @@ async function start() {
   try { state.audio = state.audio || new (window.AudioContext || window.webkitAudioContext)(); await state.audio.resume(); } catch (e) {}
   state.showLive = true;                                   // 待っているあいだは、いまの映像を見せる
   $('record').textContent = 'Cancel'; $('record').classList.add('recording');
-  for (const id of ['camera', 'exposure', 'iso', 'save', 'reset', 'toggle']) $(id).disabled = true;
+  for (const id of ['camera', 'exposure', 'iso', 'save', 'savelog', 'reset', 'toggle']) $(id).disabled = true;
   await keepAwake(true);
   const began = performance.now();
   let shown = 0;
@@ -280,6 +324,7 @@ async function start() {
 
 function beginRecording() {
   resetTrail();
+  state.motion = []; state.star = null;
   state.skip = 2;            // 設定を変えた直後のフレームは捨てる
   state.recording = true; state.showLive = false; state.startedAt = performance.now();
   $('record').textContent = 'Stop'; $('toggle').textContent = 'Show Live'; $('toggle').disabled = false;
@@ -291,7 +336,7 @@ async function cancelCountdown() {
   state.showLive = false;
   $('record').textContent = 'Start'; $('record').classList.remove('recording');
   $('camera').disabled = false; $('exposure').disabled = !state.manual; $('iso').disabled = !(state.manual && state.caps.iso);
-  $('toggle').disabled = false; $('save').disabled = state.frames === 0; $('reset').disabled = false;
+  $('toggle').disabled = false; $('save').disabled = state.frames === 0; $('savelog').disabled = state.motion.length === 0; $('reset').disabled = false;
   await keepAwake(false);
   process(false);
 }
@@ -301,17 +346,65 @@ async function stop() {
   state.recording = false; state.hasPending = false; state.elapsed = (performance.now() - state.startedAt) / 1000;
   $('record').textContent = 'Start'; $('record').classList.remove('recording');
   $('camera').disabled = false; $('exposure').disabled = !state.manual; $('iso').disabled = !(state.manual && state.caps.iso);
-  $('save').disabled = state.frames === 0; $('reset').disabled = false;
+  $('save').disabled = state.frames === 0; $('savelog').disabled = state.motion.length === 0; $('reset').disabled = false;
   await keepAwake(false);
   process(false);
+}
+
+// 撮影条件。カメラが実際に使っている値(指定した値ではなく、トラックの設定から読んだ値)を記録する。
+function conditions() {
+  const st = state.track ? state.track.getSettings() : {};
+  const perFrame = st.exposureTime ? st.exposureTime / 10000 : (st.frameRate ? 1 / st.frameRate : 0);
+  const parts = [state.frames + ' frames x ' + (perFrame ? +perFrame.toFixed(3) + ' s' : '? s') + (state.manual ? '' : ' (auto exposure)')];
+  if (st.iso) parts.push('ISO ' + Math.round(st.iso));
+  if (st.focusDistance) parts.push('focus ' + (+st.focusDistance.toFixed(2)) + ' m ' + (st.focusMode || ''));
+  if (st.colorTemperature) parts.push('WB ' + st.colorTemperature + ' K ' + (st.whiteBalanceMode || ''));
+  parts.push(canvas.width + 'x' + canvas.height, 'elapsed ' + Math.round(state.elapsed || 0) + ' s', 'lighten composite');
+  if (state.motion.length > 1) { const m = motionSummary(); parts.push('star jumps ' + m.jumps + ' (max ' + m.max + ' px)'); }
+  parts.push((navigator.userAgent.match(/(Chrome|Version)\/[\d.]+|Android [\d.]+|iPhone OS [\d_]+/g) || []).join(' '));
+  return {perFrame, iso: st.iso ? Math.round(st.iso) : 0, text: parts.join(', ')};
+}
+
+// JPEG に EXIF を埋め込む。キャンバスが書き出す JPEG には撮影情報が入らないので、最小限の EXIF(説明、ソフト名、日時、露光時間の合計、ISO、コメント)を自前で組み立てて、先頭に差し込む。
+async function withExif(blob, info) {
+  const u16 = v => [v & 255, (v >> 8) & 255], u32 = v => [v & 255, (v >> 8) & 255, (v >> 16) & 255, (v >>> 24) & 255];
+  const ascii = t => Array.from(t, c => { const k = c.charCodeAt(0); return k < 128 ? k : 63; }).concat(0);
+  // entries: [タグ, 型, 個数, 値のバイト列]。4バイトに収まらない値は、表のうしろに置いて位置を指す。
+  const ifd = (entries, offset) => {
+    const head = [...u16(entries.length)], data = [], dataStart = offset + 2 + entries.length * 12 + 4;
+    for (const [tag, type, count, value] of entries) {
+      head.push(...u16(tag), ...u16(type), ...u32(count));
+      if (value.length <= 4) head.push(...value, ...Array(4 - value.length).fill(0));
+      else { head.push(...u32(dataStart + data.length)); data.push(...value); if (data.length % 2) data.push(0); }
+    }
+    return head.concat([0, 0, 0, 0], data);
+  };
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  const date = ascii(d.getFullYear() + ':' + p(d.getMonth() + 1) + ':' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()));
+  const text = ascii(info.text), software = ascii('Web Star Trail');
+  const zeroth = pointer => ifd([[0x010E, 2, text.length, text], [0x0131, 2, software.length, software], [0x0132, 2, date.length, date], [0x8769, 4, 1, u32(pointer)]], 8);
+  const exifOffset = 8 + zeroth(0).length;
+  const total = Math.max(Math.round(info.perFrame * state.frames * 1000), 1);
+  const comment = [65, 83, 67, 73, 73, 0, 0, 0].concat(text.slice(0, -1));
+  const entries = [[0x829A, 5, 1, [...u32(total), ...u32(1000)]]];
+  if (info.iso) entries.push([0x8827, 3, 1, u16(Math.min(info.iso, 65535))]);
+  entries.push([0x9003, 2, date.length, date], [0x9286, 7, comment.length, comment]);
+  const tiff = [73, 73, 42, 0, 8, 0, 0, 0].concat(zeroth(exifOffset), ifd(entries, exifOffset));
+  const length = 2 + 6 + tiff.length;
+  const segment = new Uint8Array([0xFF, 0xE1, length >> 8, length & 255, 69, 120, 105, 102, 0, 0].concat(tiff));
+  const bytes = new Uint8Array(await blob.arrayBuffer());
+  if (bytes[0] !== 0xFF || bytes[1] !== 0xD8 || length > 65535) return blob;
+  return new Blob([bytes.subarray(0, 2), segment, bytes.subarray(2)], {type: 'image/jpeg'});
 }
 
 function stamp() { const d = new Date(), p = n => String(n).padStart(2, '0'); return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()); }
 
 async function save() {
   draw(state.trailTexture, null, false);
-  const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95));
-  const name = 'startrail-' + stamp() + '-' + state.frames + 'frames.jpg';
+  const info = conditions();
+  const blob = await withExif(await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.95)), info);
+  // ファイル名にも条件を入れる(ファイルの一覧だけで見分けられるように)
+  const name = 'startrail-' + stamp() + '-' + state.frames + 'frames' + (info.perFrame ? '-' + (+info.perFrame.toFixed(2)) + 's' : '') + (info.iso ? '-iso' + info.iso : '') + '.jpg';
   if (native('save')) {
     // アプリに埋め込まれた WebKit ではダウンロードが使えないので、アプリ側へ渡して保存してもらう
     const data = await new Promise(resolve => { const r = new FileReader(); r.onload = () => resolve(r.result.split(',')[1]); r.readAsDataURL(blob); });
@@ -321,6 +414,29 @@ async function save() {
     await fetch('/save?name=' + encodeURIComponent(name), {method: 'POST', body: blob});
   } else {
     const file = new File([blob], name, {type: 'image/jpeg'});
+    if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({files: [file]})) {
+      await navigator.share({files: [file]});
+    } else {
+      const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
+      setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+  }
+  return name;
+}
+
+// 診断の記録を CSV で保存する(設定値を先頭に、続けてフレームごとの時刻と星の位置)。
+async function saveLog() {
+  const head = '# ' + navigator.userAgent + '\n# ' + conditions().text + '\nseconds,x,y,value\n';
+  const text = head + state.motion.map(m => m.t.toFixed(2) + ',' + m.x + ',' + m.y + ',' + m.v).join('\n') + '\n';
+  const name = 'startrail-' + stamp() + '-motion.csv';
+  const blob = new Blob([text], {type: 'text/csv'});
+  if (native('save')) {
+    native('save').postMessage({name, data: btoa(text)});
+    setStatus('Saved in the app: ' + name);
+  } else if (AUTOTEST) {
+    await fetch('/save?name=' + encodeURIComponent(name), {method: 'POST', body: blob});
+  } else {
+    const file = new File([blob], name, {type: 'text/csv'});
     if (/iPhone|iPad/.test(navigator.userAgent) && navigator.canShare && navigator.canShare({files: [file]})) {
       await navigator.share({files: [file]});
     } else {
@@ -347,8 +463,9 @@ $('camera').onchange = async () => { try { await openCamera($('camera').value); 
 $('exposure').onchange = $('iso').onchange = () => applySettings();
 $('record').onclick = () => state.countdownTimer ? cancelCountdown() : state.recording ? stop() : start();
 $('toggle').onclick = () => { state.showLive = !state.showLive; $('toggle').textContent = state.showLive ? 'Show Trail' : 'Show Live'; process(false); };
-$('reset').onclick = () => { resetTrail(); $('save').disabled = true; process(false); };
+$('reset').onclick = () => { resetTrail(); state.motion = []; state.star = null; $('save').disabled = true; $('savelog').disabled = true; process(false); };
 $('save').onclick = () => save().catch(e => fail('save', e));
+$('savelog').onclick = () => saveLog().catch(e => fail('log', e));
 
 // ---- 自己確認(開発用): ?autotest を付けて開くと、操作なしで数フレーム重ねて保存し、結果を報告する ----
 if (AUTOTEST) (async () => {
@@ -364,6 +481,7 @@ if (AUTOTEST) (async () => {
       elapsed: state.elapsed, settings: state.track.getSettings(), camera: state.track.label, errors: state.errors,
       frameCallback: !!video.requestVideoFrameCallback});
     report.saved = await save();
+    report.motion = motionSummary(); report.motionSamples = state.motion.length; report.log = await saveLog();
   } catch (e) { report.fatal = String(e); report.errors = state.errors; }
   const text = JSON.stringify(report, null, 1);
   if (native('report')) native('report').postMessage(text); else fetch('/report', {method: 'POST', body: text}).catch(() => {});
